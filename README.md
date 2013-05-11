@@ -1,4 +1,12 @@
 -SO-Tema5
 =========
 
-Fifth operating systems homework - asynchronous web server
+Operating Systems Homework
+
+Asynchronous web server
+
+
+
+Contributors:
+* Diana Mincu - 331CB
+* Andreea Bejgu - 331CB
