@@ -1,4 +1,5 @@
 #include <libaio.h>
+#include <sys/epoll.h>
 
 #include "../headers/w_epoll.h"
 
