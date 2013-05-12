@@ -2,13 +2,12 @@
 
 CC=gcc
 CFLAGS=-Wall -g
-LIBFLAGS=-laio
-INCLUDE=-Isrc headers
+INCLUDE=-I.
 
 build: aws
 
 aws: src/server.c
-	$(CC) $(CFLAGS) $(INCLUDE) $(LIBFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $^
 
 clean:
 	rm -rf *.o aws
