@@ -213,6 +213,9 @@ static void handle_client_request(struct connection *conn)
 
 	connection_copy_buffers(conn);
 
+	/* TODO: nu stiu daca e bine aici, da oricum trebuie sa folosim sendfile pentru un test. */
+	sendfile(0, 0, NULL, 0);
+
 	/* add socket to epoll for out events */
 	rc = w_epoll_update_ptr_inout(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_add_ptr_inout");
