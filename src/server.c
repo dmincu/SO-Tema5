@@ -4,11 +4,13 @@
 #include <assert.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/sendfile.h>
 
 #include "../headers/util.h"
 #include "../headers/debug.h"
@@ -16,6 +18,13 @@
 #include "../headers/w_epoll.h"
 #include "../headers/aws.h"
 
+#include "http-parser/http_parser.h"
+
+/* parser used for requests */
+static http_parser request_parser;
+
+/* storage for request_path */
+static char request_path[BUFSIZ];
 
 /* server socket file descriptor */
 static int listenfd;
@@ -40,10 +49,42 @@ struct connection {
 	enum connection_state state;
 };
 
+typedef struct conn {
+	struct connection *elem;
+	struct conn *next;
+} connection_list;
+
+connection_list *my_connection;
+
+/*
+ * Callback is invoked by HTTP request parser when parsing request path.
+ * Request path is stored in global request_path variable.
+ */
+static int on_path_cb(http_parser *p, const char *buf, size_t len)
+{
+	assert(p == &request_parser);
+	memcpy(request_path, buf, len);
+
+	return 0;
+}
+
+/* Use mostly null settings except for on_path callback. */
+static http_parser_settings settings_on_path = {
+	/* on_message_begin */ 0,
+	/* on_header_field */ 0,
+	/* on_header_value */ 0,
+	/* on_path */ on_path_cb,
+	/* on_url */ 0,
+	/* on_fragment */ 0,
+	/* on_query_string */ 0,
+	/* on_body */ 0,
+	/* on_headers_complete */ 0,
+	/* on_message_complete */ 0
+};
+
 /*
  * Initialize connection structure on given socket.
  */
-
 static struct connection *connection_create(int sockfd)
 {
 	struct connection *conn = malloc(sizeof(*conn));
@@ -156,8 +197,8 @@ remove_connection:
 
 static enum connection_state send_message(struct connection *conn)
 {
-	ssize_t bytes_sent;
-	int rc;
+	ssize_t bytes_sent, bytes_parsed;
+	int rc, fd;
 	char abuffer[64];
 
 	rc = get_peer_address(conn->sockfd, abuffer, 64);
@@ -166,19 +207,46 @@ static enum connection_state send_message(struct connection *conn)
 		goto remove_connection;
 	}
 
-	bytes_sent = send(conn->sockfd, conn->send_buffer, conn->send_len, 0);
-	if (bytes_sent < 0) {		/* error in communication */
-		dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
-		goto remove_connection;
-	}
-	if (bytes_sent == 0) {		/* connection closed */
-		dlog(LOG_INFO, "Connection closed to %s\n", abuffer);
-		goto remove_connection;
-	}
 
-	dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
+	memset(request_path, 0, BUFSIZ);
+	bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, conn->recv_buffer, conn->recv_len);
+	fprintf(stderr, "Parsed HTTP request (bytes: %lu), path: %s\n", bytes_parsed, request_path);
 
-	printf("--\n%s--\n", conn->send_buffer);
+	fd = open(request_path, O_RDWR);
+	if (!fd){
+		memset(conn->send_buffer, 0, BUFSIZ);
+		sprintf(conn->send_buffer, "HTTP/1.1 404 Not Found");
+		conn->send_len = strlen("HTTP/1.1 404 Not Found");
+
+		bytes_sent = send(conn->sockfd, conn->send_buffer, conn->send_len, 0);
+		if (bytes_sent < 0) {
+			dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
+			goto remove_connection;
+		}
+		if (bytes_sent == 0) {
+			dlog(LOG_INFO, "Connection closed to %s\n", abuffer);
+			goto remove_connection;
+		}
+
+		dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
+
+		printf("--\n%s--\n", conn->send_buffer);
+	}
+	else{
+		/* TODO: nu stiu daca e bine aici, da oricum trebuie sa folosim sendfile pentru un test. */
+		dlog(LOG_DEBUG, "Using sendfile\n");
+
+		int sz = lseek(fd, 0, SEEK_END);
+		lseek(fd, 0, SEEK_SET);
+
+		/* TODO: trimis fisiere, acum da bad file descriptor */
+		//if (strstr(request_path, "static") != NULL)
+		rc = sendfile(conn->sockfd, fd, NULL, sz);
+		if (rc < 0) {
+			ERR("sendfile");
+			goto remove_connection;
+		}
+	}
 
 	/* all done - remove out notification */
 	rc = w_epoll_update_ptr_in(epollfd, conn->sockfd, conn);
@@ -213,9 +281,6 @@ static void handle_client_request(struct connection *conn)
 
 	connection_copy_buffers(conn);
 
-	/* TODO: nu stiu daca e bine aici, da oricum trebuie sa folosim sendfile pentru un test. */
-	sendfile(0, 0, NULL, 0);
-
 	/* add socket to epoll for out events */
 	rc = w_epoll_update_ptr_inout(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_add_ptr_inout");
@@ -224,6 +289,9 @@ static void handle_client_request(struct connection *conn)
 int main(int argc, char **argv)
 {
 	int rc;
+
+	/* init HTTP_REQUEST parser */
+	http_parser_init(&request_parser, HTTP_REQUEST);
 
 	/* init multiplexing */
 	epollfd = w_epoll_create();
