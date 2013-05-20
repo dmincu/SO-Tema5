@@ -25,6 +25,7 @@ static http_parser request_parser;
 
 /* storage for request_path */
 static char request_path[BUFSIZ];
+static char final_path[BUFSIZ];
 
 /* server socket file descriptor */
 static int listenfd;
@@ -197,7 +198,8 @@ remove_connection:
 
 static enum connection_state send_message(struct connection *conn)
 {
-	ssize_t bytes_sent, bytes_parsed;
+	ssize_t bytes_sent; 
+	long unsigned int bytes_parsed;
 	int rc, fd;
 	char abuffer[64];
 
@@ -211,41 +213,54 @@ static enum connection_state send_message(struct connection *conn)
 	memset(request_path, 0, BUFSIZ);
 	bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, conn->recv_buffer, conn->recv_len);
 	fprintf(stderr, "Parsed HTTP request (bytes: %lu), path: %s\n", bytes_parsed, request_path);
-
+	
+	memset(final_path, 0, BUFSIZ);
+	sprintf(final_path, "%s%s", AWS_DOCUMENT_ROOT, request_path);
 	fd = open(request_path, O_RDWR);
 	if (!fd){
+		fprintf(stderr, "HTTP/1.0 404 Not Found\n");
 		memset(conn->send_buffer, 0, BUFSIZ);
-		sprintf(conn->send_buffer, "HTTP/1.1 404 Not Found");
-		conn->send_len = strlen("HTTP/1.1 404 Not Found");
-
-		bytes_sent = send(conn->sockfd, conn->send_buffer, conn->send_len, 0);
-		if (bytes_sent < 0) {
-			dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
-			goto remove_connection;
-		}
-		if (bytes_sent == 0) {
-			dlog(LOG_INFO, "Connection closed to %s\n", abuffer);
-			goto remove_connection;
-		}
-
-		dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
-
-		printf("--\n%s--\n", conn->send_buffer);
+		sprintf(conn->send_buffer, "HTTP/1.0 404 Not Found\n");
+		conn->send_len = strlen("HTTP/1.0 404 Not Found\n");
 	}
 	else{
-		/* TODO: nu stiu daca e bine aici, da oricum trebuie sa folosim sendfile pentru un test. */
-		dlog(LOG_DEBUG, "Using sendfile\n");
+		fprintf(stderr, "HTTP/1.0 200 OK\n");
+		memset(conn->send_buffer, 0, BUFSIZ);
+		sprintf(conn->send_buffer, "HTTP/1.0 200 OK\n");
+		conn->send_len = strlen("HTTP/1.0 200 OK\n");
+	}
 
+	bytes_sent = send(conn->sockfd, conn->send_buffer, conn->send_len, 0);
+	if (bytes_sent < 0) {
+		dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
+		fprintf(stderr, "Error in communication to %s\n", abuffer);
+		goto remove_connection;
+	}
+	if (bytes_sent == 0) {
+		dlog(LOG_INFO, "Connection closed to %s\n", abuffer);
+		fprintf(stderr, "Connection closed to %s\n", abuffer);
+		goto remove_connection;
+	}
+
+	dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
+
+	printf("--\n%s--\n", conn->send_buffer);
+
+	if (fd){
 		int sz = lseek(fd, 0, SEEK_END);
 		lseek(fd, 0, SEEK_SET);
 
 		/* TODO: trimis fisiere, acum da bad file descriptor */
-		//if (strstr(request_path, "static") != NULL)
-		rc = sendfile(conn->sockfd, fd, NULL, sz);
-		if (rc < 0) {
-			ERR("sendfile");
-			goto remove_connection;
-		}
+		//if (strstr(request_path, "static") != NULL){
+			fprintf(stderr, "Using sendfile\n");
+			rc = sendfile(conn->sockfd, fd, NULL, sz);
+			if (rc < 0) {
+				ERR("sendfile");
+				goto remove_connection;
+			}
+		//}
+	
+		close(fd);
 	}
 
 	/* all done - remove out notification */
@@ -257,6 +272,9 @@ static enum connection_state send_message(struct connection *conn)
 	return STATE_DATA_SENT;
 
 remove_connection:
+	if (fd > 0)
+		close(fd);
+
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_remove_ptr");
 
