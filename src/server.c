@@ -265,6 +265,9 @@ static void handle_client_request(struct connection *conn)
 	if (ret_state == STATE_CONNECTION_CLOSED)
 		return;
 
+	/* init HTTP_REQUEST parser */
+	http_parser_init(&request_parser, HTTP_REQUEST);
+
 	memset(request_path, 0, BUFSIZ);
 	bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, conn->recv_buffer, conn->recv_len);
 	fprintf(stderr, "Parsed HTTP request (bytes: %lu), path: %s\n", bytes_parsed, request_path);
@@ -291,9 +294,6 @@ static void handle_client_request(struct connection *conn)
 int main(int argc, char **argv)
 {
 	int rc;
-
-	/* init HTTP_REQUEST parser */
-	http_parser_init(&request_parser, HTTP_REQUEST);
 
 	/* init multiplexing */
 	epollfd = w_epoll_create();
