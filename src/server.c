@@ -25,7 +25,6 @@ static http_parser request_parser;
 
 /* storage for request_path */
 static char request_path[BUFSIZ];
-static char final_path[BUFSIZ];
 
 /* server socket file descriptor */
 static int listenfd;
@@ -42,6 +41,8 @@ enum connection_state {
 /* structure acting as a connection handler */
 struct connection {
 	int sockfd;
+	int fd;
+	char pathname[BUFSIZ];
 	/* buffers used for receiving messages and then echoing them back */
 	char recv_buffer[BUFSIZ];
 	size_t recv_len;
@@ -99,21 +100,13 @@ static struct connection *connection_create(int sockfd)
 }
 
 /*
- * Copy receive buffer to send buffer (echo).
- */
-
-static void connection_copy_buffers(struct connection *conn)
-{
-	conn->send_len = conn->recv_len;
-	memcpy(conn->send_buffer, conn->recv_buffer, conn->send_len);
-}
-
-/*
  * Remove connection handler.
  */
 
 static void connection_remove(struct connection *conn)
 {
+	if (conn->fd > 0)
+		close(conn->fd);
 	close(conn->sockfd);
 	conn->state = STATE_CONNECTION_CLOSED;
 	free(conn);
@@ -198,36 +191,14 @@ remove_connection:
 
 static enum connection_state send_message(struct connection *conn)
 {
-	ssize_t bytes_sent; 
-	long unsigned int bytes_parsed;
-	int rc, fd;
+	ssize_t bytes_sent;
+	int rc;
 	char abuffer[64];
 
 	rc = get_peer_address(conn->sockfd, abuffer, 64);
 	if (rc < 0) {
 		ERR("get_peer_address");
 		goto remove_connection;
-	}
-
-
-	memset(request_path, 0, BUFSIZ);
-	bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, conn->recv_buffer, conn->recv_len);
-	fprintf(stderr, "Parsed HTTP request (bytes: %lu), path: %s\n", bytes_parsed, request_path);
-	
-	memset(final_path, 0, BUFSIZ);
-	sprintf(final_path, "%s%s", AWS_DOCUMENT_ROOT, request_path);
-	fd = open(request_path, O_RDWR);
-	if (!fd){
-		fprintf(stderr, "HTTP/1.0 404 Not Found\n");
-		memset(conn->send_buffer, 0, BUFSIZ);
-		sprintf(conn->send_buffer, "HTTP/1.0 404 Not Found\n");
-		conn->send_len = strlen("HTTP/1.0 404 Not Found\n");
-	}
-	else{
-		fprintf(stderr, "HTTP/1.0 200 OK\n");
-		memset(conn->send_buffer, 0, BUFSIZ);
-		sprintf(conn->send_buffer, "HTTP/1.0 200 OK\n");
-		conn->send_len = strlen("HTTP/1.0 200 OK\n");
 	}
 
 	bytes_sent = send(conn->sockfd, conn->send_buffer, conn->send_len, 0);
@@ -246,21 +217,21 @@ static enum connection_state send_message(struct connection *conn)
 
 	printf("--\n%s--\n", conn->send_buffer);
 
-	if (fd){
-		int sz = lseek(fd, 0, SEEK_END);
-		lseek(fd, 0, SEEK_SET);
+	if (conn->fd != -1){
+		struct stat *buf = calloc(1, sizeof(struct stat));
 
-		/* TODO: trimis fisiere, acum da bad file descriptor */
-		//if (strstr(request_path, "static") != NULL){
+		fstat(conn->fd, buf);
+
+		/* TODO: trimis fisiere si in mod dinamic */
+		if (strstr(request_path, "static") != NULL){
 			fprintf(stderr, "Using sendfile\n");
-			rc = sendfile(conn->sockfd, fd, NULL, sz);
-			if (rc < 0) {
-				ERR("sendfile");
-				goto remove_connection;
-			}
-		//}
+			bytes_sent += sendfile(conn->sockfd, conn->fd, NULL, buf->st_size);
+		}
+		else{
+
+		}
 	
-		close(fd);
+		free(buf);
 	}
 
 	/* all done - remove out notification */
@@ -269,11 +240,7 @@ static enum connection_state send_message(struct connection *conn)
 
 	conn->state = STATE_DATA_SENT;
 
-	return STATE_DATA_SENT;
-
 remove_connection:
-	if (fd > 0)
-		close(fd);
 
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_remove_ptr");
@@ -291,13 +258,30 @@ remove_connection:
 static void handle_client_request(struct connection *conn)
 {
 	int rc;
+	long unsigned int bytes_parsed;
 	enum connection_state ret_state;
 
 	ret_state = receive_message(conn);
 	if (ret_state == STATE_CONNECTION_CLOSED)
 		return;
 
-	connection_copy_buffers(conn);
+	memset(request_path, 0, BUFSIZ);
+	bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, conn->recv_buffer, conn->recv_len);
+	fprintf(stderr, "Parsed HTTP request (bytes: %lu), path: %s\n", bytes_parsed, request_path);
+	
+	memset(conn->pathname, 0, BUFSIZ);
+	sprintf(conn->pathname, "%s%s", AWS_DOCUMENT_ROOT, request_path);
+	conn->fd = open(conn->pathname, O_RDWR);
+	
+	memset(conn->send_buffer, 0, BUFSIZ);
+	if (conn->fd == -1){
+		sprintf(conn->send_buffer, "HTTP/1.0 404 Not Found\r\n\r\n");
+		conn->send_len = strlen("HTTP/1.0 404 Not Found\r\n\r\n");
+	}
+	else{
+		sprintf(conn->send_buffer, "HTTP/1.0 200 OK\r\n\r\n");
+		conn->send_len = strlen("HTTP/1.0 200 OK\r\n\r\n");
+	}
 
 	/* add socket to epoll for out events */
 	rc = w_epoll_update_ptr_inout(epollfd, conn->sockfd, conn);
