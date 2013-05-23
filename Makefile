@@ -7,7 +7,7 @@ INCLUDE=-I. -I./headers/ -I./src/ -I./src/http-parser/
 build: aws
 
 aws: ./src/server.o ./src/sock_util.o ./src/http-parser/http_parser.o
-	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $^
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $^ -laio
 
 ./src/server.o: ./src/server.c
 
