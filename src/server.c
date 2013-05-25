@@ -69,7 +69,9 @@ struct connection {
 	struct iocb **piocb_read;
 	struct iocb *iocb_write;
 	struct iocb **piocb_write;
-	char **buffer;
+	io_context_t ctx;
+	struct stat *buf;
+	char buffer[BUFSIZ];
 	int iocbs;
 	int efd;
 };
@@ -126,6 +128,10 @@ static void connection_remove(struct connection *conn)
 		close(conn->fd);
 	close(conn->sockfd);
 	conn->state = STATE_CONNECTION_CLOSED;
+
+	/* Destroy aio context */
+	io_destroy(conn->ctx);
+
 	free(conn);
 }
 
@@ -150,6 +156,12 @@ static void handle_new_connection(void)
 
 	/* Instantiate new connection handler */
 	conn = connection_create(sockfd);
+
+	/* Setup aio context */
+	rc = io_setup(conn->iocbs, &(conn->ctx));
+	if (rc < 0){
+		ERR("io_setup");
+	}
 
 	/* Add socket to epoll */
 	rc = w_epoll_add_ptr_in(epollfd, sockfd, conn);
@@ -237,9 +249,7 @@ static void wait_aio(io_context_t ctx, int nops)
 /* Reads from the file into a buffer */
 static void io_read_from_file(struct connection *conn){
 	int n_aio_ops, i, rc;
-
-	/* AIO context */
-	io_context_t ctx = 0;
+	int size = conn->buf->st_size > BUFSIZ ? BUFSIZ : conn->buf->st_size;
 
 	/* Allocate iocb_read and piocb_read */
 	conn->iocb_read = (struct iocb *) malloc(conn->iocbs * sizeof(struct iocb));
@@ -254,28 +264,19 @@ static void io_read_from_file(struct connection *conn){
 
 	/* Read into buffer */
 	for (i = 0; i < conn->iocbs; i++){
-		io_prep_pread(&(conn->iocb_read[i]), conn->fd, conn->buffer[i], BUFSIZ, i * BUFSIZ);
+		io_prep_pread(&(conn->iocb_read[i]), conn->fd, conn->buffer, size, i * BUFSIZ);
 		conn->piocb_read[i] = &(conn->iocb_read[i]);
 		io_set_eventfd(&(conn->iocb_read[i]), conn->efd);
 	}
 
-	/* Setup aio context */
-	rc = io_setup(conn->iocbs, &ctx);
-	if (rc < 0){
-		ERR("io_setup");
-	}
-
 	/* Submit aio */
-	n_aio_ops = io_submit(ctx, conn->iocbs, conn->piocb_read);
+	n_aio_ops = io_submit(conn->ctx, conn->iocbs, conn->piocb_read);
 	if (n_aio_ops < 0){
 		ERR("io_submit");
 	}
 
 	/* Wait for completion*/
-	wait_aio(ctx, conn->iocbs);
-
-	/* Destroy aio context */
-	io_destroy(ctx);
+	wait_aio(conn->ctx, conn->iocbs);
 }
 
 /* Uses the buffer filled by the read function and sends the
@@ -283,9 +284,7 @@ static void io_read_from_file(struct connection *conn){
  */
 static void io_write_to_socket(struct connection *conn){
 	int n_aio_ops, i, rc;
-
-	/* AIO context */
-	io_context_t ctx = 0;
+	int size = conn->buf->st_size > BUFSIZ ? BUFSIZ : conn->buf->st_size;
 
 	/* Allocate iocb_write and piocb_write */
 	conn->iocb_write = (struct iocb *) malloc(conn->iocbs * sizeof(struct iocb));
@@ -300,28 +299,19 @@ static void io_write_to_socket(struct connection *conn){
 
 	/* Write from buffer */
 	for (i = 0; i < conn->iocbs; i++){
-		io_prep_pwrite(&(conn->iocb_write[i]), conn->sockfd, conn->buffer[i], BUFSIZ, 0);
+		io_prep_pwrite(&(conn->iocb_write[i]), conn->sockfd, conn->buffer, size, 0);
 		conn->piocb_write[i] = &(conn->iocb_write[i]);
 		io_set_eventfd(&(conn->iocb_write[i]), conn->efd);
 	}
 
-	/* Setup aio context */
-	rc = io_setup(conn->iocbs, &ctx);
-	if (rc < 0){
-		ERR("io_setup");
-	}
-
 	/* Submit aio */
-	n_aio_ops = io_submit(ctx, conn->iocbs, conn->piocb_write);
+	n_aio_ops = io_submit(conn->ctx, conn->iocbs, conn->piocb_write);
 	if (n_aio_ops < 0){
 		ERR("io_submit");
 	}
 
 	/* Wait for completion*/
-	wait_aio(ctx, conn->iocbs);
-
-	/* Destroy aio context */
-	io_destroy(ctx);
+	wait_aio(conn->ctx, conn->iocbs);
 }
 
 /*
@@ -358,9 +348,9 @@ static enum connection_state send_message(struct connection *conn)
 
 	/* If there isn't an error, then send files either with sendfile or aio */
 	if (conn->fd != -1){
-		struct stat *buf = calloc(1, sizeof(struct stat));
+		conn->buf = calloc(1, sizeof(struct stat));
 
-		fstat(conn->fd, buf);
+		fstat(conn->fd, conn->buf);
 
 		if (check_if_static_file_path(request_path)){
 			/* Process static files */
@@ -368,11 +358,11 @@ static enum connection_state send_message(struct connection *conn)
 			off_t total_sent = 0;
 			int size = BUFSIZ;
 
-			while (total_sent < buf->st_size){
-				if (total_sent + BUFSIZ >= buf->st_size)
-					size = total_sent + BUFSIZ - buf->st_size;
+			while (total_sent < conn->buf->st_size){
+				if (total_sent + BUFSIZ >= conn->buf->st_size)
+					size = total_sent + BUFSIZ - conn->buf->st_size;
 
-				rc = sendfile(conn->sockfd, conn->fd, NULL, buf->st_size);
+				rc = sendfile(conn->sockfd, conn->fd, NULL, conn->buf->st_size);
 				if (rc == -1){
 					ERR("sendfile\n");
 				}
@@ -395,16 +385,7 @@ static enum connection_state send_message(struct connection *conn)
 
 			eefd = conn->efd;
 
-			conn->iocbs = buf->st_size / BUFSIZ + (buf->st_size % BUFSIZ == 0 ? 0 : 1);
-
-			conn->buffer = calloc(conn->iocbs, sizeof(char *));
-			for (i = 0; i < conn->iocbs; i++)
-				conn->buffer[i] = calloc(1, BUFSIZ * sizeof(char));
-
-			if (conn->buffer == NULL){
-				ERR("calloc");
-				goto remove_connection;
-			}
+			conn->iocbs = conn->buf->st_size / BUFSIZ + (conn->buf->st_size % BUFSIZ == 0 ? 0 : 1);
 
 			/* Read from file into buffer */
 			io_read_from_file(conn);
@@ -413,14 +394,13 @@ static enum connection_state send_message(struct connection *conn)
 			io_write_to_socket(conn);
 
 			/* Free resources */
-			free(conn->buffer);
 			free(conn->iocb_read);
 			free(conn->iocb_write);
 			free(conn->piocb_read);
 			free(conn->piocb_write);
 		}
 	
-		free(buf);
+		free(conn->buf);
 	}
 
 	/* All done - remove out notification */
