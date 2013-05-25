@@ -71,7 +71,7 @@ struct connection {
 	struct iocb **piocb_write;
 	io_context_t ctx;
 	struct stat *buf;
-	char buffer[BUFSIZ];
+	char **buffer;
 	int iocbs;
 	int efd;
 };
@@ -129,9 +129,6 @@ static void connection_remove(struct connection *conn)
 	close(conn->sockfd);
 	conn->state = STATE_CONNECTION_CLOSED;
 
-	/* Destroy aio context */
-	io_destroy(conn->ctx);
-
 	free(conn);
 }
 
@@ -156,12 +153,6 @@ static void handle_new_connection(void)
 
 	/* Instantiate new connection handler */
 	conn = connection_create(sockfd);
-
-	/* Setup aio context */
-	rc = io_setup(conn->iocbs, &(conn->ctx));
-	if (rc < 0){
-		ERR("io_setup");
-	}
 
 	/* Add socket to epoll */
 	rc = w_epoll_add_ptr_in(epollfd, sockfd, conn);
@@ -226,7 +217,7 @@ remove_connection:
  * Wait for asynchronous I/O operations
  * (io_getevents)
  */
-static void wait_aio(io_context_t ctx, int nops)
+static int wait_aio(io_context_t ctx, int nops)
 {
 	struct io_event *events;
 	int rc;
@@ -244,11 +235,13 @@ static void wait_aio(io_context_t ctx, int nops)
 	}
 
 	free(events);
+
+	return rc;
 }
 
 /* Reads from the file into a buffer */
 static void io_read_from_file(struct connection *conn){
-	int n_aio_ops, i, rc;
+	int i;
 	int size = conn->buf->st_size > BUFSIZ ? BUFSIZ : conn->buf->st_size;
 
 	/* Allocate iocb_read and piocb_read */
@@ -264,26 +257,17 @@ static void io_read_from_file(struct connection *conn){
 
 	/* Read into buffer */
 	for (i = 0; i < conn->iocbs; i++){
-		io_prep_pread(&(conn->iocb_read[i]), conn->fd, conn->buffer, size, i * BUFSIZ);
+		io_prep_pread(&(conn->iocb_read[i]), conn->fd, conn->buffer[i], size, i * BUFSIZ);
 		conn->piocb_read[i] = &(conn->iocb_read[i]);
 		io_set_eventfd(&(conn->iocb_read[i]), conn->efd);
 	}
-
-	/* Submit aio */
-	n_aio_ops = io_submit(conn->ctx, conn->iocbs, conn->piocb_read);
-	if (n_aio_ops < 0){
-		ERR("io_submit");
-	}
-
-	/* Wait for completion*/
-	wait_aio(conn->ctx, conn->iocbs);
 }
 
 /* Uses the buffer filled by the read function and sends the
  * the file on sockfd.
  */
 static void io_write_to_socket(struct connection *conn){
-	int n_aio_ops, i, rc;
+	int i;
 	int size = conn->buf->st_size > BUFSIZ ? BUFSIZ : conn->buf->st_size;
 
 	/* Allocate iocb_write and piocb_write */
@@ -299,19 +283,10 @@ static void io_write_to_socket(struct connection *conn){
 
 	/* Write from buffer */
 	for (i = 0; i < conn->iocbs; i++){
-		io_prep_pwrite(&(conn->iocb_write[i]), conn->sockfd, conn->buffer, size, 0);
+		io_prep_pwrite(&(conn->iocb_write[i]), conn->sockfd, conn->buffer[i], size, 0);
 		conn->piocb_write[i] = &(conn->iocb_write[i]);
 		io_set_eventfd(&(conn->iocb_write[i]), conn->efd);
 	}
-
-	/* Submit aio */
-	n_aio_ops = io_submit(conn->ctx, conn->iocbs, conn->piocb_write);
-	if (n_aio_ops < 0){
-		ERR("io_submit");
-	}
-
-	/* Wait for completion*/
-	wait_aio(conn->ctx, conn->iocbs);
 }
 
 /*
@@ -374,7 +349,7 @@ static enum connection_state send_message(struct connection *conn)
 		}
 		else{
 			/* Process dynamic files */
-			int i;
+			int i, n_aio_ops;
 
 			/* Initialize new connection */
 			conn->efd = eventfd(0, 0);
@@ -387,13 +362,57 @@ static enum connection_state send_message(struct connection *conn)
 
 			conn->iocbs = conn->buf->st_size / BUFSIZ + (conn->buf->st_size % BUFSIZ == 0 ? 0 : 1);
 
+			conn->buffer = calloc(conn->iocbs, sizeof(char*));
+			for (i = 0; i < conn->iocbs; i++)
+				conn->buffer[i] = calloc(BUFSIZ, sizeof(char));
+
+			/* Setup aio context */
+			rc = io_setup(conn->iocbs, &(conn->ctx));
+			if (rc < 0){
+				ERR("io_setup");
+			}
+
 			/* Read from file into buffer */
 			io_read_from_file(conn);
 
 			/* Write from buffer to socket */
 			io_write_to_socket(conn);
 
+			for (i = 0; i < conn->iocbs; i++){
+				rc = 0;
+
+				while (rc != 1){				
+					/* Submit aio */
+					n_aio_ops = io_submit(conn->ctx, 1, &(conn->piocb_read[i]));
+					if (n_aio_ops < 0){
+						ERR("io_submit");
+					}
+
+					/* Wait for completion*/
+					rc = wait_aio(conn->ctx, 1);
+				}
+
+				rc = 0;
+				while (rc != 1){
+					/* Submit aio */
+					n_aio_ops = io_submit(conn->ctx, 1, &(conn->piocb_write[i]));
+					if (n_aio_ops < 0){
+						ERR("io_submit");
+					}
+
+					/* Wait for completion*/
+					rc = wait_aio(conn->ctx, 1);
+				}
+			}
+
+			/* Destroy aio context */
+			io_destroy(conn->ctx);
+
 			/* Free resources */
+			for (i = 0; i < conn->iocbs; i++){
+				free(conn->buffer[i]);
+			}
+			free(conn->buffer);
 			free(conn->iocb_read);
 			free(conn->iocb_write);
 			free(conn->piocb_read);
