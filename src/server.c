@@ -241,7 +241,7 @@ static int wait_aio(io_context_t ctx, int nops)
 
 /* Reads from the file into a buffer */
 static void io_read_from_file(struct connection *conn){
-	int i;
+	int i, n_aio_ops;
 	int size = conn->buf->st_size > BUFSIZ ? BUFSIZ : conn->buf->st_size;
 
 	/* Allocate iocb_read and piocb_read */
@@ -261,13 +261,19 @@ static void io_read_from_file(struct connection *conn){
 		conn->piocb_read[i] = &(conn->iocb_read[i]);
 		io_set_eventfd(&(conn->iocb_read[i]), conn->efd);
 	}
+
+	/* Submit aio */
+	n_aio_ops = io_submit(conn->ctx, conn->iocbs, conn->piocb_read);
+	if (n_aio_ops < 0){
+		ERR("io_submit");
+	}
 }
 
 /* Uses the buffer filled by the read function and sends the
  * the file on sockfd.
  */
 static void io_write_to_socket(struct connection *conn){
-	int i;
+	int i, n_aio_ops;
 	int size = conn->buf->st_size > BUFSIZ ? BUFSIZ : conn->buf->st_size;
 
 	/* Allocate iocb_write and piocb_write */
@@ -286,6 +292,12 @@ static void io_write_to_socket(struct connection *conn){
 		io_prep_pwrite(&(conn->iocb_write[i]), conn->sockfd, conn->buffer[i], size, 0);
 		conn->piocb_write[i] = &(conn->iocb_write[i]);
 		io_set_eventfd(&(conn->iocb_write[i]), conn->efd);
+	}
+
+	/* Submit aio */
+	n_aio_ops = io_submit(conn->ctx, conn->iocbs, conn->piocb_write);
+	if (n_aio_ops < 0){
+		ERR("io_submit");
 	}
 }
 
@@ -349,7 +361,7 @@ static enum connection_state send_message(struct connection *conn)
 		}
 		else{
 			/* Process dynamic files */
-			int i, n_aio_ops;
+			int i;
 
 			/* Initialize new connection */
 			conn->efd = eventfd(0, 0);
@@ -357,8 +369,6 @@ static enum connection_state send_message(struct connection *conn)
 				ERR("eventfd");
 				goto remove_connection;
 			}
-
-			eefd = conn->efd;
 
 			conn->iocbs = conn->buf->st_size / BUFSIZ + (conn->buf->st_size % BUFSIZ == 0 ? 0 : 1);
 
@@ -377,33 +387,18 @@ static enum connection_state send_message(struct connection *conn)
 
 			/* Write from buffer to socket */
 			io_write_to_socket(conn);
+			
+			rc = 0;
+			//while (rc < conn->iocbs){				
+				/* Wait for completion*/
+				rc += wait_aio(conn->ctx, conn->iocbs);
+			//}
 
-			for (i = 0; i < conn->iocbs; i++){
-				rc = 0;
-
-				while (rc != 1){				
-					/* Submit aio */
-					n_aio_ops = io_submit(conn->ctx, 1, &(conn->piocb_read[i]));
-					if (n_aio_ops < 0){
-						ERR("io_submit");
-					}
-
-					/* Wait for completion*/
-					rc = wait_aio(conn->ctx, 1);
-				}
-
-				rc = 0;
-				while (rc != 1){
-					/* Submit aio */
-					n_aio_ops = io_submit(conn->ctx, 1, &(conn->piocb_write[i]));
-					if (n_aio_ops < 0){
-						ERR("io_submit");
-					}
-
-					/* Wait for completion*/
-					rc = wait_aio(conn->ctx, 1);
-				}
-			}
+			rc = 0;
+			//while (rc < conn->iocbs){
+				/* Wait for completion*/
+				rc += wait_aio(conn->ctx, conn->iocbs);
+			//}
 
 			/* Destroy aio context */
 			io_destroy(conn->ctx);
