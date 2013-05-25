@@ -1,3 +1,9 @@
+/* Diana Mincu - 331CB
+ * Andreea Bejgu - 331CB
+ * Tema 5 - Sisteme de Operare
+ * Server asincron
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,18 +28,19 @@
 
 #include "http-parser/http_parser.h"
 
+#define STATIC "static"
 #define NUM_OPS 10
 
-/* parser used for requests */
+/* Parser used for requests */
 static http_parser request_parser;
 
-/* storage for request_path */
+/* Storage for request_path */
 static char request_path[BUFSIZ];
 
-/* server socket file descriptor */
+/* Server socket file descriptor */
 static int listenfd;
 
-/* epoll file descriptor */
+/* Epoll file descriptor */
 static int epollfd;
 
 enum connection_state {
@@ -42,26 +49,30 @@ enum connection_state {
 	STATE_CONNECTION_CLOSED
 };
 
-/* structure acting as a connection handler */
+/* Structure acting as a connection handler */
 struct connection {
 	int sockfd;
+
+	/* File information variables */
 	int fd;
 	char pathname[BUFSIZ];
 
-	/* buffers used for receiving messages and then echoing them back */
+	/* Buffers used for receiving messages and then echoing them back */
 	char recv_buffer[BUFSIZ];
 	size_t recv_len;
 	char send_buffer[BUFSIZ];
 	size_t send_len;
 	enum connection_state state;
 
-	struct iocb *iocb;
-	struct iocb **piocb;
+	/* Variables used for dynamic files */
+	struct iocb *iocb_read;
+	struct iocb **piocb_read;
+	struct iocb *iocb_write;
+	struct iocb **piocb_write;
+	char **buffer;
 	int iocbs;
 	int efd;
 };
-
-char buffer[BUFSIZ];
 
 int eefd;
 
@@ -109,7 +120,6 @@ static struct connection *connection_create(int sockfd)
 /*
  * Remove connection handler.
  */
-
 static void connection_remove(struct connection *conn)
 {
 	if (conn->fd > 0)
@@ -122,7 +132,6 @@ static void connection_remove(struct connection *conn)
 /*
  * Handle a new connection request on the server socket.
  */
-
 static void handle_new_connection(void)
 {
 	static int sockfd;
@@ -131,7 +140,7 @@ static void handle_new_connection(void)
 	struct connection *conn;
 	int rc;
 
-	/* accept new connection */
+	/* Accept new connection */
 	sockfd = accept(listenfd, (SSA *) &addr, &addrlen);
 	DIE(sockfd < 0, "accept");
 
@@ -139,19 +148,25 @@ static void handle_new_connection(void)
 
 	fcntl(sockfd, F_SETFL, O_NONBLOCK);
 
-	/* instantiate new connection handler */
+	/* Instantiate new connection handler */
 	conn = connection_create(sockfd);
 
-	/* add socket to epoll */
+	/* Add socket to epoll */
 	rc = w_epoll_add_ptr_in(epollfd, sockfd, conn);
 	DIE(rc < 0, "w_epoll_add_in");
+}
+
+static int check_if_static_file_path(char *path){
+	if (strstr(path, STATIC) != NULL)
+		return 1;
+	else
+		return 0;
 }
 
 /*
  * Receive message on socket.
  * Store message in recv_buffer in struct connection.
  */
-
 static enum connection_state receive_message(struct connection *conn)
 {
 	ssize_t bytes_recv;
@@ -165,11 +180,13 @@ static enum connection_state receive_message(struct connection *conn)
 	}
 
 	bytes_recv = recv(conn->sockfd, conn->recv_buffer, BUFSIZ, 0);
-	if (bytes_recv < 0) {		/* error in communication */
+	/* Error in communication */	
+	if (bytes_recv < 0) {
 		dlog(LOG_ERR, "Error in communication from: %s\n", abuffer);
 		goto remove_connection;
 	}
-	if (bytes_recv == 0) {		/* connection closed */
+	/* Connection closed */
+	if (bytes_recv == 0) {
 		dlog(LOG_INFO, "Connection closed from: %s\n", abuffer);
 		goto remove_connection;
 	}
@@ -187,31 +204,28 @@ remove_connection:
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_remove_ptr");
 
-	/* remove current connection */
+	/* Remove current connection */
 	connection_remove(conn);
 
 	return STATE_CONNECTION_CLOSED;
 }
 
 /*
- * wait for asynchronous I/O operations
- * (eventfd or io_getevents)
+ * Wait for asynchronous I/O operations
+ * (io_getevents)
  */
 static void wait_aio(io_context_t ctx, int nops)
 {
 	struct io_event *events;
 	int rc;
 
-	/* TODO 1 - alloc structure */
+	/* Alloc structure */
 	events = (struct io_event *) malloc(nops * sizeof(struct io_event));
 	if (events == NULL){
 		ERR("malloc");
 	}
 
-	/* Wait for async operations to finish 
-	 *
-	 * 	Use only io_getevents()
-	 */
+	/* Wait for async operations to finish */
 	rc = io_getevents(ctx, nops, nops, events, NULL);
 	if (rc < 0){
 		ERR("io_getevents");
@@ -220,16 +234,104 @@ static void wait_aio(io_context_t ctx, int nops)
 	free(events);
 }
 
+/* Reads from the file into a buffer */
+static void io_read_from_file(struct connection *conn){
+	int n_aio_ops, i, rc;
+
+	/* AIO context */
+	io_context_t ctx = 0;
+
+	/* Allocate iocb_read and piocb_read */
+	conn->iocb_read = (struct iocb *) malloc(conn->iocbs * sizeof(struct iocb));
+	if (conn->iocb_read == NULL){
+		ERR("malloc");
+	}
+
+	conn->piocb_read = (struct iocb **) malloc(conn->iocbs * sizeof(struct iocb *));
+	if (conn->piocb_read == NULL){
+		ERR("malloc");
+	}
+
+	/* Read into buffer */
+	for (i = 0; i < conn->iocbs; i++){
+		io_prep_pread(&(conn->iocb_read[i]), conn->fd, conn->buffer[i], BUFSIZ, i * BUFSIZ);
+		conn->piocb_read[i] = &(conn->iocb_read[i]);
+		io_set_eventfd(&(conn->iocb_read[i]), conn->efd);
+	}
+
+	/* Setup aio context */
+	rc = io_setup(conn->iocbs, &ctx);
+	if (rc < 0){
+		ERR("io_setup");
+	}
+
+	/* Submit aio */
+	n_aio_ops = io_submit(ctx, conn->iocbs, conn->piocb_read);
+	if (n_aio_ops < 0){
+		ERR("io_submit");
+	}
+
+	/* Wait for completion*/
+	wait_aio(ctx, conn->iocbs);
+
+	/* Destroy aio context */
+	io_destroy(ctx);
+}
+
+/* Uses the buffer filled by the read function and sends the
+ * the file on sockfd.
+ */
+static void io_write_to_socket(struct connection *conn){
+	int n_aio_ops, i, rc;
+
+	/* AIO context */
+	io_context_t ctx = 0;
+
+	/* Allocate iocb_write and piocb_write */
+	conn->iocb_write = (struct iocb *) malloc(conn->iocbs * sizeof(struct iocb));
+	if (conn->iocb_write == NULL){
+		ERR("malloc");
+	}
+
+	conn->piocb_write = (struct iocb **) malloc(conn->iocbs * sizeof(struct iocb *));
+	if (conn->piocb_write == NULL){
+		ERR("malloc");
+	}
+
+	/* Write from buffer */
+	for (i = 0; i < conn->iocbs; i++){
+		io_prep_pwrite(&(conn->iocb_write[i]), conn->sockfd, conn->buffer[i], BUFSIZ, 0);
+		conn->piocb_write[i] = &(conn->iocb_write[i]);
+		io_set_eventfd(&(conn->iocb_write[i]), conn->efd);
+	}
+
+	/* Setup aio context */
+	rc = io_setup(conn->iocbs, &ctx);
+	if (rc < 0){
+		ERR("io_setup");
+	}
+
+	/* Submit aio */
+	n_aio_ops = io_submit(ctx, conn->iocbs, conn->piocb_write);
+	if (n_aio_ops < 0){
+		ERR("io_submit");
+	}
+
+	/* Wait for completion*/
+	wait_aio(ctx, conn->iocbs);
+
+	/* Destroy aio context */
+	io_destroy(ctx);
+}
 
 /*
  * Send message on socket.
  * Store message in send_buffer in struct connection.
  */
-
 static enum connection_state send_message(struct connection *conn)
 {
 	ssize_t bytes_sent;
-	int rc, i;
+	int rc;
 	char abuffer[64];
 
 	rc = get_peer_address(conn->sockfd, abuffer, 64);
@@ -254,83 +356,74 @@ static enum connection_state send_message(struct connection *conn)
 
 	printf("--\n%s--\n", conn->send_buffer);
 
+	/* If there isn't an error, then send files either with sendfile or aio */
 	if (conn->fd != -1){
 		struct stat *buf = calloc(1, sizeof(struct stat));
 
 		fstat(conn->fd, buf);
 
-		/* TODO: trimis fisiere si in mod dinamic */
-		if (strstr(request_path, "static") != NULL){
-			fprintf(stderr, "Using sendfile\n");
+		if (check_if_static_file_path(request_path)){
+			/* Process static files */
+
 			off_t total_sent = 0;
 			int size = BUFSIZ;
 
 			while (total_sent < buf->st_size){
 				if (total_sent + BUFSIZ >= buf->st_size)
 					size = total_sent + BUFSIZ - buf->st_size;
-				fprintf(stderr, "%i %i\n", (int)total_sent, (int)buf->st_size);
+
 				rc = sendfile(conn->sockfd, conn->fd, NULL, buf->st_size);
 				if (rc == -1){
 					ERR("sendfile\n");
 				}
-				else
+				else{
 					total_sent += rc;
+					bytes_sent += rc;
+				}
 			}
 		}
 		else{
-			/* io_submit etc */
-			int n_aio_ops;
+			/* Process dynamic files */
+			int i;
 
-			/* initializez o noua conexiune aici, eventfd?*/
+			/* Initialize new connection */
 			conn->efd = eventfd(0, 0);
+			if (conn->efd < 0){
+				ERR("eventfd");
+				goto remove_connection;
+			}
+
 			eefd = conn->efd;
 
-			/* AIO context */
-			io_context_t ctx;
-
 			conn->iocbs = buf->st_size / BUFSIZ + (buf->st_size % BUFSIZ == 0 ? 0 : 1);
-			
-			/* Allocate iocb and piocb */
-			conn->iocb = (struct iocb *) malloc(conn->iocbs * sizeof(*(conn->iocb)));
-			if (conn->iocb == NULL){
-				ERR("malloc");
-			}
 
-			conn->piocb = (struct iocb **) malloc(conn->iocbs * sizeof(*(conn->piocb)));
-			if (conn->piocb == NULL){
-				ERR("malloc");
-			}
-
+			conn->buffer = calloc(conn->iocbs, sizeof(char *));
 			for (i = 0; i < conn->iocbs; i++)
-			{
-				io_prep_pwrite(&(conn->iocb[i]), conn->fd, buffer, BUFSIZ, 0);
-				conn->piocb[i] = &(conn->iocb[i]);
-				io_set_eventfd(&(conn->iocb[i]), conn->efd);
+				conn->buffer[i] = calloc(1, BUFSIZ * sizeof(char));
+
+			if (conn->buffer == NULL){
+				ERR("calloc");
+				goto remove_connection;
 			}
 
-			/* Setup aio context */
-			rc = io_setup(conn->iocbs, &ctx);
-			if (rc < 0){
-				ERR("io_setup");
-			}
+			/* Read from file into buffer */
+			io_read_from_file(conn);
 
-			/* Submit aio */
-			n_aio_ops = io_submit(ctx, conn->iocbs, conn->piocb);
-			if (n_aio_ops < 0){
-				ERR("io_submit");
-			}
+			/* Write from buffer to socket */
+			io_write_to_socket(conn);
 
-			/* Wait for completion*/
-			wait_aio(ctx, conn->iocbs);
-
-			/* Destroy aio context */
-			io_destroy(ctx);
+			/* Free resources */
+			free(conn->buffer);
+			free(conn->iocb_read);
+			free(conn->iocb_write);
+			free(conn->piocb_read);
+			free(conn->piocb_write);
 		}
 	
 		free(buf);
 	}
 
-	/* all done - remove out notification */
+	/* All done - remove out notification */
 	rc = w_epoll_update_ptr_in(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_update_ptr_in");
 
@@ -341,7 +434,7 @@ remove_connection:
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_remove_ptr");
 
-	/* remove current connection */
+	/* Remove current connection */
 	connection_remove(conn);
 
 	return STATE_CONNECTION_CLOSED;
@@ -350,7 +443,6 @@ remove_connection:
 /*
  * Handle a client request on a client connection.
  */
-
 static void handle_client_request(struct connection *conn)
 {
 	int rc;
@@ -361,7 +453,7 @@ static void handle_client_request(struct connection *conn)
 	if (ret_state == STATE_CONNECTION_CLOSED)
 		return;
 
-	/* init HTTP_REQUEST parser */
+	/* Init HTTP_REQUEST parser */
 	http_parser_init(&request_parser, HTTP_REQUEST);
 
 	memset(request_path, 0, BUFSIZ);
@@ -372,6 +464,7 @@ static void handle_client_request(struct connection *conn)
 	sprintf(conn->pathname, "%s%s", AWS_DOCUMENT_ROOT, request_path);
 	conn->fd = open(conn->pathname, O_RDWR);
 	
+	/* Fill in response */
 	memset(conn->send_buffer, 0, BUFSIZ);
 	if (conn->fd == -1){
 		sprintf(conn->send_buffer, "HTTP/1.0 404 Not Found\r\n\r\n");
@@ -382,20 +475,20 @@ static void handle_client_request(struct connection *conn)
 		conn->send_len = strlen("HTTP/1.0 200 OK\r\n\r\n");
 	}
 
-	/* add socket to epoll for out events */
+	/* Add socket to epoll for out events */
 	rc = w_epoll_update_ptr_inout(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_add_ptr_inout");
 }
 
 int main(int argc, char **argv)
 {
-	int rc, bytes_sent,i;
+	int rc;
 
-	/* init multiplexing */
+	/* Init multiplexing */
 	epollfd = w_epoll_create();
 	DIE(epollfd < 0, "w_epoll_create");
 
-	/* create server socket */
+	/* Create server socket */
 	listenfd = tcp_create_listener(AWS_LISTEN_PORT, DEFAULT_LISTEN_BACKLOG);
 	DIE(listenfd < 0, "tcp_create_listener");
 
@@ -404,16 +497,16 @@ int main(int argc, char **argv)
 
 	dlog(LOG_INFO, "Server waiting for connections on port %d\n", AWS_LISTEN_PORT);
 
-	/* server main loop */
+	/* Server main loop */
 	while (1) {
 		struct epoll_event rev;
 
-		/* wait for events */
+		/* Wait for events */
 		rc = w_epoll_wait_infinite(epollfd, &rev);
 		DIE(rc < 0, "w_epoll_wait_infinite");
 
 		/*
-		 * switch event types; consider
+		 * Switch event types; consider
 		 *   - new connection requests (on server socket)
 		 *   - socket communication (on connection sockets)
 		 */
