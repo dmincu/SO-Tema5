@@ -138,6 +138,8 @@ static void handle_new_connection(void)
 
 	dlog(LOG_ERR, "Accepted connection from: %s:%d\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
+	fcntl(sockfd, F_SETFL, O_NONBLOCK);
+
 	/* instantiate new connection handler */
 	conn = connection_create(sockfd);
 
@@ -231,9 +233,23 @@ static enum connection_state send_message(struct connection *conn)
 		fstat(conn->fd, buf);
 
 		/* TODO: trimis fisiere si in mod dinamic */
-		if (strstr(request_path, "static") != NULL){
+		if (strstr(request_path, "static") != -1){
 			fprintf(stderr, "Using sendfile\n");
-			bytes_sent += sendfile(conn->sockfd, conn->fd, NULL, buf->st_size);
+			off_t total_sent = 0;
+			int size = BUFSIZ;
+
+			while (total_sent < buf->st_size){
+				if (total_sent + BUFSIZ >= buf->st_size)
+					size = total_sent + BUFSIZ - buf->st_size;
+				fprintf(stderr, "%i %i\n", total_sent, buf->st_size);
+				rc = sendfile(conn->sockfd, conn->fd, NULL, buf->st_size);
+				if (rc == -1){
+					ERR("sendfile\n");
+					//goto remove_connection;
+				}
+				else
+					total_sent += rc;
+			}
 		}
 		else{
 			/* io_submit etc */
@@ -372,7 +388,7 @@ int main(int argc, char **argv)
 			if (rev.events & EPOLLIN)
 				handle_new_connection();
 		}
-		else if (rev.data.fd == eefd)
+		/*else if (rev.data.fd == eefd)
 		{
 			fprintf(stderr,"aici\n");
 			struct connection *conn = ((struct connection *)rev.data.ptr);
@@ -396,8 +412,8 @@ int main(int argc, char **argv)
 			DIE(rc < 0, "w_epoll_remove_ptr");
 
 			/* remove current connection */
-			connection_remove(conn);
-		}
+			/*connection_remove(conn);
+		}*/
 		else {
 			if (rev.events & EPOLLIN) {
 				dlog(LOG_DEBUG, "New message\n");
