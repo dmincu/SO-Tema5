@@ -14,6 +14,12 @@ Contributors:
 Andreea Bejgu
 =============
 
+I worked on the asynchronous file sending. I added the necessary fields in the structure we used for each connection (iocb structures, event descriptor, number of transfers) and I tried diferent solutions. First I tried to initialize all the iocb structures for reading from the file and to transfer each piece of size BUFSIZ into a buffer which eventually would contain the whole file. Then after receiving the file I would send it part by part on the socket, but this solution wasn't efficient and didn't serve the purpose.
+
+Then I tried to add the event for the connection in the epollfd set of descriptors on which I was waiting for a notification. When a notification arrived on that eventfd, I would check to see how many AIO finished and tried to send on the socket as many parts as I could. After the whole file was sent, the connection closed (the send_message function returned before closing the connection, if the parameter dynamic was found).
+
+Eventually we combined the solutions and tried to send the file piece-by-piece; when a AIO read operation finished we started an AIO write one  (sending on the socket).
+
 
 
 Diana Mincu
